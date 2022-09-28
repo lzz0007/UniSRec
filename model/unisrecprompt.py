@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from recbole.model.sequential_recommender.sasrec import SASRec
+from typing import Tuple, Optional, Union
 
 
 class PWLayer(nn.Module):
@@ -59,13 +60,29 @@ class MoEAdaptorLayer(nn.Module):
         return multiple_outputs.sum(dim=-2)
 
 
-class UniSRec(SASRec):
+class MLP(nn.Module):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+    def __init__(self, sizes: Tuple[int, ...], bias=True, act=nn.ReLU):
+        super(MLP, self).__init__()
+        layers = []
+        for i in range(len(sizes) - 1):
+            layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=bias))
+            if i < len(sizes) - 2:
+                layers.append(act())
+        self.model = nn.Sequential(*layers)
+
+
+class UniSRecPrompt(SASRec):
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
 
         self.train_stage = config['train_stage']
         self.temperature = config['temperature']
         self.lam = config['lambda']
+        self.n_items = dataset.item_num
 
         assert self.train_stage in [
             'pretrain', 'inductive_ft', 'transductive_ft'
@@ -84,22 +101,71 @@ class UniSRec(SASRec):
             config['adaptor_dropout_prob']
         )
 
+        # prompt
+        # prefix_size = config['prefix_size']
+        # prefix_length = config['prefix_length']
+        # self.clip_project = MLP((prefix_size, (self.hidden_size * prefix_length) // 2,
+        #                          self.hidden_size * prefix_length))
+        self.pre_seq_len = config['n_prefix']
+        # self.prefix_embeds = nn.Parameter(torch.empty(self.n_prefix, self.hidden_size)).to(self.device)
+        # nn.init.normal_(self.prefix_embeds)
+        # self.prefix_embeds = nn.Embedding(dataset.user_num, self.hidden_size, padding_idx=0).to(self.device)
+        self.prefix_proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size // 2, self.hidden_size)
+        )
+        # self.clip_project = MLP((self.hidden_size, (self.hidden_size * self.n_prefix) // 2,
+        #                          self.hidden_size * self.n_prefix))
+
+        self.position_embedding = nn.Embedding(self.max_seq_length + self.pre_seq_len, self.hidden_size)
+
+        # self.prefix_embeds = nn.Parameter(torch.empty(13102+1, self.hidden_size)).to(self.device)
+        # nn.init.normal_(self.prefix_embeds)
+        # self.experts = nn.ModuleList([PWLayer(self.hidden_size, self.hidden_size, config['adaptor_dropout_prob'])
+        #                               for i in range(self.n_prefix)])
+
+        self.prefix_tokens = torch.arange(self.pre_seq_len).long()
+        self.prefix_encoder = torch.nn.Embedding(self.pre_seq_len, self.hidden_size)
+
+    def get_prompt(self, batch_size):
+        prefix_tokens = self.prefix_tokens.unsqueeze(0).expand(batch_size, -1).to(self.device)
+        prompts = self.prefix_encoder(prefix_tokens)
+        prompts = self.prefix_proj(prompts)
+        return prompts
+
     def forward(self, item_seq, item_emb, item_seq_len):
-        position_ids = torch.arange(item_seq.size(1), dtype=torch.long, device=item_seq.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
+        # expert_outputs = [self.experts[i](self.prefix_embeds) for i in range(self.n_prefix)]
+        # expert_outputs = [expert_outputs[i][batch_users, :].unsqueeze(-2) for i in range(self.n_prefix)]
+        # prefix = torch.cat(expert_outputs, dim=1)
+        # prefix = self.prefix_embeds(batch_users).unsqueeze(1) # B * H
+        # prompt_embeds = torch.cat((prefix, item_emb), dim=1)
+
+        prompts = self.get_prompt(batch_size=item_seq.shape[0])
+        inputs_embeds = torch.cat((prompts, item_emb), dim=1)
+
+        position_ids = torch.arange(item_seq.size(1)+self.pre_seq_len, dtype=torch.long, device=item_seq.device)
+        position_ids = position_ids.expand(item_seq.shape[0], -1)
+        # position_ids = torch.arange(item_seq.size(1), dtype=torch.long, device=item_seq.device)
+        # position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
         position_embedding = self.position_embedding(position_ids)
 
-        input_emb = item_emb + position_embedding
+        input_emb = inputs_embeds + position_embedding
+        # input_emb = item_emb + position_embedding
         if self.train_stage == 'transductive_ft':
             input_emb = input_emb + self.item_embedding(item_seq)
         input_emb = self.LayerNorm(input_emb)
         input_emb = self.dropout(input_emb)
 
-        extended_attention_mask = self.get_attention_mask(item_seq)
+        # attention mask
+        prompt_attention_mask = prompts.new_ones((item_seq.shape[0], self.pre_seq_len))
+        extended_item_seq = torch.cat([prompt_attention_mask, item_seq], dim=1)
+        extended_attention_mask = self.get_attention_mask(extended_item_seq)
+        # extended_attention_mask = self.get_attention_mask(item_seq)
 
         trm_output = self.trm_encoder(input_emb, extended_attention_mask, output_all_encoded_layers=True)
         output = trm_output[-1]
-        output = self.gather_indexes(output, item_seq_len - 1)
+        output = self.gather_indexes(output, item_seq_len+self.pre_seq_len - 1)
         return output  # [B H]
 
     def seq_item_contrastive_task(self, seq_output, same_pos_id, interaction):
@@ -157,7 +223,15 @@ class UniSRec(SASRec):
         # Loss for fine-tuning
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
+
+        # # random sample a few items for each seq
+        # rand_items = torch.randint(1, self.n_items, (item_seq.shape[0], self.n_prefix)).to(self.device)
+        # item_seq = torch.cat((rand_items, item_seq), dim=1)
+        # item_seq_len += self.n_prefix
+
         item_emb_list = self.moe_adaptor(self.plm_embedding(item_seq))
+        # batch_users = interaction['user_id']
+
         seq_output = self.forward(item_seq, item_emb_list, item_seq_len)
         test_item_emb = self.moe_adaptor(self.plm_embedding.weight)
         if self.train_stage == 'transductive_ft':
@@ -175,6 +249,7 @@ class UniSRec(SASRec):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         item_emb_list = self.moe_adaptor(self.plm_embedding(item_seq))
+        # batch_users = interaction['user_id']
         seq_output = self.forward(item_seq, item_emb_list, item_seq_len)
         test_items_emb = self.moe_adaptor(self.plm_embedding.weight)
         if self.train_stage == 'transductive_ft':
