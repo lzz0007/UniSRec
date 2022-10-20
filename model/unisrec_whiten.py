@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from recbole.model.sequential_recommender.sasrec import SASRec
+import math
 
 
 class PWLayer(nn.Module):
@@ -73,12 +74,12 @@ class UniSRecWhiten(SASRec):
 
         # self.gamma = nn.Parameter(torch.zeros(768, 300), requires_grad=True)
         # self.beta = nn.Parameter(torch.zeros(768), requires_grad=True)
-        self.g = 8
+        # self.g = 8
         self.white_linear = nn.Linear(768, self.hidden_size)
-        self.plm_embedding_whiten = nn.Embedding(self.n_items, self.hidden_size, padding_idx=0)
-        plm_emb_whiten = self.channel_whitening(dataset.plm_embedding.weight, self.g)
-        self.plm_embedding_whiten.weight.requires_grad = False
-        self.plm_embedding_whiten.weight.data.copy_(plm_emb_whiten)
+        # self.plm_embedding_whiten = nn.Embedding(self.n_items, self.hidden_size, padding_idx=0)
+        # plm_emb_whiten = self.channel_whitening(dataset.plm_embedding.weight, self.g)
+        # self.plm_embedding_whiten.weight.requires_grad = False
+        # self.plm_embedding_whiten.weight.data.copy_(plm_emb_whiten)
 
         # self.moe_adaptor = MoEAdaptorLayer(
         #     config['n_exps'],
@@ -108,19 +109,23 @@ class UniSRecWhiten(SASRec):
         # item_seq = interaction['item_seq_sorted']
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
 
-        # get the items of a batch
-        items_in_batch = torch.unique(item_seq[item_seq != 0])
-        items_in_batch_whitened = self.channel_whitening(self.plm_embedding(items_in_batch), self.g) # here calculate grad
-        self.plm_embedding_whiten.weight[items_in_batch] = items_in_batch_whitened.detach()
-        item_emb_list = self.plm_embedding_whiten(item_seq)
+        # # get the items of a batch
+        # items_in_batch = torch.unique(item_seq[item_seq != 0])
+        # items_in_batch_whitened = self.channel_whitening(self.plm_embedding(items_in_batch), self.g) # here calculate grad
+        # self.plm_embedding_whiten.weight[items_in_batch] = items_in_batch_whitened
+        # item_emb_list = self.plm_embedding_whiten(item_seq)
         # test_item_emb = self.channel_whitening(self.plm_embedding.weight, self.g)
         # item_emb_list = self.moe_adaptor(self.plm_embedding(item_seq))
+
+        self.test_item_emb = self.batch_whitening(self.plm_embedding.weight)
+        item_emb_list = self.test_item_emb[item_seq]
+
         seq_output = self.forward(item_seq, item_emb_list, item_seq_len)
         # test_item_emb = self.moe_adaptor(self.plm_embedding.weight)
-        test_item_emb = self.plm_embedding_whiten.weight
+        # test_item_emb = self.plm_embedding_whiten.weight
 
         seq_output = F.normalize(seq_output, dim=1)
-        test_item_emb = F.normalize(test_item_emb, dim=1)
+        test_item_emb = F.normalize(self.test_item_emb, dim=1)
 
         logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1)) / self.temperature
         pos_items = interaction[self.POS_ITEM_ID]
@@ -130,14 +135,16 @@ class UniSRecWhiten(SASRec):
     def full_sort_predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        item_emb_list = self.plm_embedding_whiten(item_seq)
+        # item_emb_list = self.plm_embedding_whiten(item_seq)
         # item_emb_list = self.moe_adaptor(self.plm_embedding(item_seq))
+
+        item_emb_list = self.test_item_emb[item_seq]
         seq_output = self.forward(item_seq, item_emb_list, item_seq_len)
         # test_items_emb = self.moe_adaptor(self.plm_embedding.weight)
-        test_items_emb = self.plm_embedding_whiten.weight
+        # test_items_emb = self.plm_embedding_whiten.weight
 
         seq_output = F.normalize(seq_output, dim=-1)
-        test_items_emb = F.normalize(test_items_emb, dim=-1)
+        test_items_emb = F.normalize(self.test_item_emb, dim=-1)
 
         scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B n_items]
         return scores
@@ -171,17 +178,19 @@ class UniSRecWhiten(SASRec):
         # return output * gamma + beta
 
     def batch_whitening(self, x):
-        import math
         N, D = x.shape
-        G = math.ceil(2 * D / N)
+        # G = math.ceil(2 * D / N)
+        G = 2
         new_idx = torch.randperm(D)
         x = x.t()[new_idx].t()
         x = x.view(N, G, D // G)
         x = (x - x.mean(dim=0, keepdim=True)).transpose(0, 1)  # G, N, D//G
         covs = x.transpose(1, 2).bmm(x) / N
-        W = transformation(covs, x.device, engine=self.engine)
+        W = transformation(covs, x.device, engine='svd')
         x = x.bmm(W)
-        return x.transpose(1, 2).flatten(0, 1)[torch.argsort(new_idx)].t()
+        output = x.transpose(1, 2).flatten(0, 1)[torch.argsort(new_idx)].t()
+        output = self.white_linear(output)
+        return output
 
 
 def transformation(covs, device, engine='symeig'):
